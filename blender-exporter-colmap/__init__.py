@@ -1,16 +1,18 @@
+# [TODO] this is the reviesd version of blender-exporter-colmap
+
 import numpy as np
 from pathlib import Path
 import mathutils
 from . ext.read_write_model import write_model, Camera, Image
-from bpy_extras.io_utils import ExportHelper
-from bpy.props import StringProperty
 import bpy
+from bpy.props import StringProperty, EnumProperty
+
 bl_info = {
     "name": "Scene exporter for colmap",
     "description": "Generates a dataset for colmap by exporting blender camera poses and rendering scene.",
     "author": "Ohayoyogi",
     "version": (0, 1, 0),
-    "blender": (3, 6, 0),
+    "blender": (4, 0, 0),
     "location": "File/Export",
     "warning": "",
     "wiki_url": "https://github.com/ohayoyogi/blender-exporter-colmap",
@@ -18,142 +20,187 @@ bl_info = {
     "category": "Import-Export"
 }
 
+class COLMAP_OT_export_dataset(bpy.types.Operator):
+    """Export scene as colmap dataset"""
+    bl_idname = "export_scene.colmap_dataset"
+    bl_label = "Export Colmap Dataset"
 
-class BlenderExporterForColmap(bpy.types.Operator, ExportHelper):
+    # Properties
+    directory: StringProperty(
+        name="Output Directory",
+        description="Directory to save the dataset",
+        subtype="DIR_PATH"
+    )
 
-    filename_ext = "."
+    export_format: EnumProperty(
+        name="Format",
+        description="Output format for colmap model",
+        items=[
+            ('.txt', "Text (.txt)", "Export as text files"),
+            ('.bin', "Binary (.bin)", "Export as binary files"),
+        ],
+        default='.txt'
+    )
 
-    directory: StringProperty()
+    camera_model: EnumProperty(
+        name="Camera Model",
+        description="Camera model to use for export",
+        items=[
+            ('SIMPLE_PINHOLE', "SIMPLE_PINHOLE", "Simple pinhole model (f, cx, cy)"),
+            ('PINHOLE', "PINHOLE", "Pinhole model (fx, fy, cx, cy)"),
+            ('OPENCV', "OPENCV", "OpenCV model with distortion (fx, fy, cx, cy, k1, k2, p1, p2)"),
+        ],
+        default='PINHOLE'
+    )
 
-    filter_folder = True
+    def invoke(self, context, event):
+        # Open the file browser to select the output directory
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
 
-    def export_dataset(self, context, dirpath: Path, format: str):
+    def execute(self, context):
+        dirpath = Path(self.directory)
+        if not dirpath.name:
+            dirpath = dirpath.parent
+
+        if not dirpath.exists():
+            try:
+                dirpath.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                self.report({'ERROR'}, f"Permission denied: cannot create directory {dirpath}")
+                return {'CANCELLED'}
+
+        # Start progress bar
+        context.window_manager.progress_begin(0, 100)
+
+        try:
+            for progress in self.process_dataset(context, dirpath, self.export_format, self.camera_model):
+                context.window_manager.progress_update(progress)
+        except Exception as e:
+            self.report({'ERROR'}, f"Export failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            context.window_manager.progress_end()
+            return {'CANCELLED'}
+            
+        context.window_manager.progress_end()
+        self.report({'INFO'}, "Colmap dataset exported successfully")
+        return {'FINISHED'}
+
+    def process_dataset(self, context, dirpath: Path, format: str, camera_model: str):
         scene = context.scene
-        scene_cameras = [i for i in scene.objects if i.type == "CAMERA"]
+        # Select all cameras in view layer
+        scene_cameras = [obj for obj in scene.objects if obj.type == "CAMERA"]
 
-        output_format = format if format in ['.txt', '.bin'] else '.txt'
-
+        if len(scene_cameras) == 0:
+            raise ValueError("No cameras found in scene")
+        
         scale = scene.render.resolution_percentage / 100.0
+        width = int(scene.render.resolution_x * scale)
+        height = int(scene.render.resolution_y * scale)
 
-        output_dir = dirpath
-        images_dir = output_dir / 'images'
-
-        output_dir.mkdir(parents=True, exist_ok=True)
+        images_dir = dirpath / 'images'
+        images_dir.mkdir(parents=True, exist_ok=True)
 
         cameras = {}
         images = {}
-        for idx, cam in enumerate(sorted(scene_cameras, key=lambda x: x.name_full + ".jpg")):
-            camera_id = idx+1
-            filename = f'{cam.name_full}.jpg'
-            width = scene.render.resolution_x
-            height = scene.render.resolution_y
-            focal_length = cam.data.lens
-            sensor_width = cam.data.sensor_width
-            sensor_height = cam.data.sensor_height
-            fx = focal_length * width / sensor_width
-            fy = focal_length * height / sensor_height
-            # fx, fy, cx, cy, k1, k2, p1, p2
-            params = [fx, fy, width/2, height/2, 0, 0, 0, 0]
+
+        # Blender (Right, Up, Back) -> OpenCV/COLMAP (Right, Down, Forward)
+        coord_trans = mathutils.Matrix.Diagonal((1.0, -1.0, -1.0, 1.0))
+        
+        total_steps = len(scene_cameras) + 1
+
+        for idx, cam in enumerate(sorted(scene_cameras, key=lambda x: x.name)):
+            camera_id = idx + 1
+            filename = f'{cam.name}.jpg'
+
+            # Intrinsic
+            focal_length = cam.data.lens # mm
+            sensor_width = cam.data.sensor_width # mm
+            sensor_height = cam.data.sensor_height # mm
+
+            # Sensor fit
+            if cam.data.sensor_fit == 'VERTICAL':
+                s_size = sensor_height
+                pixel_size = height
+            else:
+                s_size = sensor_width
+                pixel_size = width
+
+            # Focal length in pixels unit
+            f_in_pixels = (focal_length * pixel_size) / s_size
+
+            # Camera parameters by model
+            if camera_model == 'SIMPLE_PINHOLE':
+                params = [f_in_pixels, width/2, height/2]
+            elif camera_model == 'PINHOLE':
+                params = [f_in_pixels, f_in_pixels, width/2, height/2]
+            elif camera_model == 'OPENCV':
+                params = [f_in_pixels, f_in_pixels, width/2, height/2, 0, 0, 0, 0]
+            else:
+                raise ValueError(f"Unsupported camera model: {camera_model}")
+            
             cameras[camera_id] = Camera(
                 id=camera_id,
-                model='OPENCV',
-                width=width,
-                height=height,
+                model=camera_model,
+                width=width, 
+                height=height, 
                 params=params
             )
 
-            image_id = camera_id
-            rotation_mode_bk = cam.rotation_mode
 
-            cam.rotation_mode = "QUATERNION"
-            cam_rot_orig = mathutils.Quaternion(cam.rotation_quaternion)
-            cam_rot = mathutils.Quaternion((
-                cam_rot_orig.x,
-                cam_rot_orig.w,
-                cam_rot_orig.z,
-                -cam_rot_orig.y))
-            qw = cam_rot.w
-            qx = cam_rot.x
-            qy = cam_rot.y
-            qz = cam_rot.z
-            cam.rotation_mode = rotation_mode_bk
+            # Extrinsic
 
-            T = mathutils.Vector(cam.location)
-            T1 = -(cam_rot.to_matrix() @ T)
+            # camera to world matrix
+            cam_to_world = cam.matrix_world.copy()
+            # flip y and z axes
+            cam_to_world_cv = cam_to_world @ coord_trans
 
-            tx = T1[0]
-            ty = T1[1]
-            tz = T1[2]
-            images[image_id] = Image(
-                id=image_id,
-                qvec=np.array([qw, qx, qy, qz]),
-                tvec=np.array([tx, ty, tz]),
+            # world to camera matrix for colmap 
+            world_to_cam = cam_to_world_cv.inverted()
+
+            # spilit into rotation and translation
+            tvec = world_to_cam.translation()
+            rot_quat = world_to_cam.to_quaternion()
+
+            images[camera_id] = Image(
+                id=camera_id, 
+                qvec=np.array([rot_quat.w, rot_quat.x, rot_quat.y, rot_quat.z]),
+                tvec=np.array([tvec.x, tvec.y, tvec.z]),
                 camera_id=camera_id,
-                name=filename,
-                xys=[],
-                point3D_ids=[]
+                nema=filename, 
+                xys=np.array([]),
+                point3D_ids=np.array([])
             )
 
-            # Render scene
-            bpy.context.scene.camera = cam
-            bpy.ops.render.render()
-            bpy.data.images['Render Result'].save_render(
-                str(images_dir / filename))
-            yield 100.0 * idx / (len(scene_cameras) + 1)
 
-        write_model(cameras, images, {}, str(output_dir), output_format)
+            # Rendering
+            context.scene.camera = cam
+            
+            # Output path
+            render_filepath = images_dir / filename
+            context.scene.render.filename = str(render_filepath)
+
+            # Render scene
+            bpy.ops.render.render(write_still=True)
+
+            yield 100.0 * (idx + 1) / total_steps
+
+        # Write models
+        write_model(cameras, images, {}, str(dirpath), format)
         yield 100.0
 
-    def execute_(self, context, format):
-        dirpath = Path(self.directory)
-        if not dirpath.is_dir():
-            return {"WARNING", "Illegal directory was passed: " + self.directory}
-
-        context.window_manager.progress_begin(0, 100)
-        for progress in self.export_dataset(context, dirpath, format):
-            context.window_manager.progress_update(progress)
-        context.window_manager.progress_end()
-
-        return {"FINISHED"}
-
-
-class BlenderExporterForColmapBinary(BlenderExporterForColmap):
-    bl_idname = "object.colmap_dataset_generator_binary"
-    bl_label = "Export as colmap dataset with binary format"
-    bl_options = {"PRESET"}
-
-    def execute(self, context):
-        return super().execute_(context, '.bin')
-
-
-class BlenderExporterForColmapText(BlenderExporterForColmap):
-    bl_idname = "object.colmap_dataset_generator_text"
-    bl_label = "Export as colmap dataset with text format"
-    bl_options = {"PRESET"}
-
-    def execute(self, context):
-        return super().execute_(context, '.txt')
-
-
-def _blender_export_operator_function(topbar_file_import, context):
-    topbar_file_import.layout.operator(
-        BlenderExporterForColmapText.bl_idname, text="Colmap dataset (.txt)"
-    )
-    topbar_file_import.layout.operator(
-        BlenderExporterForColmapBinary.bl_idname, text="Colmap dataset (.bin)"
-    )
-
+    
+def menu_func_export(self, context):
+    self.layout.operator(COLMAP_OT_export_dataset.bl_idname, text="Colmap dataset")
 
 def register():
-    bpy.utils.register_class(BlenderExporterForColmapBinary)
-    bpy.utils.register_class(BlenderExporterForColmapText)
-    bpy.types.TOPBAR_MT_file_export.append(_blender_export_operator_function)
-
+    bpy.utils.register_class(COLMAP_OT_export_dataset)
+    bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
 def unregister():
-    bpy.utils.unregister_class(BlenderExporterForColmapBinary)
-    bpy.utils.unregister_class(BlenderExporterForColmapText)
-
+    bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
+    bpy.utils.unregister_class(COLMAP_OT_export_dataset)
 
 if __name__ == "__main__":
     register()
