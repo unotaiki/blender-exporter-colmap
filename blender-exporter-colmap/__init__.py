@@ -3,7 +3,7 @@
 import numpy as np
 from pathlib import Path
 import mathutils
-from . ext.read_write_model import write_model, Camera, Image
+from . ext.read_write_model import write_model, Camera, Image, Point3D
 import bpy
 from bpy.props import StringProperty, EnumProperty
 
@@ -104,6 +104,7 @@ class COLMAP_OT_export_dataset(bpy.types.Operator):
 
         cameras = {}
         images = {}
+        points3D = {}
 
         # Blender (Right, Up, Back) -> OpenCV/COLMAP (Right, Down, Forward)
         coord_trans = mathutils.Matrix.Diagonal((1.0, -1.0, -1.0, 1.0))
@@ -113,6 +114,10 @@ class COLMAP_OT_export_dataset(bpy.types.Operator):
         for idx, cam in enumerate(sorted(scene_cameras, key=lambda x: x.name)):
             camera_id = idx + 1
             filename = f'{cam.name}.jpg'
+
+            # ----------------------------------------
+            # 1. cameras.txt
+            # ----------------------------------------
 
             # Intrinsic
             focal_length = cam.data.lens # mm
@@ -149,6 +154,9 @@ class COLMAP_OT_export_dataset(bpy.types.Operator):
             )
 
 
+            # ----------------------------------------
+            # 2. images.txt
+            # ----------------------------------------
             # Extrinsic
 
             # camera to world matrix
@@ -186,9 +194,17 @@ class COLMAP_OT_export_dataset(bpy.types.Operator):
 
             yield 100.0 * (idx + 1) / total_steps
 
+        # ----------------------------------------
+        # 3. points3D.txt (Requested Feature)
+        # ----------------------------------------
+
+
+
+
         # Write models
         write_model(cameras, images, {}, str(dirpath), format)
         yield 100.0
+
 
     
 def menu_func_export(self, context):
